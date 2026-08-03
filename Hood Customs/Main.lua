@@ -37,6 +37,8 @@ local selected_targets = {}
 local lplr_pos = nil
 local last_random_off = nil
 local last_random_t = 0
+local orbit_angle = 0
+local orbit_last_t = 0
 
 local cfg = {
 	on = false,
@@ -47,10 +49,13 @@ local cfg = {
 	y = 2,
 	strafe_speed = 50,
 	shoot = true,
-	hitbox = "Head",
+	hitbox = "HumanoidRootPart",
 	delay = 0,
-	burst = 4,
-	pred = 0.06,
+	burst = 6,
+	pred = 0.12,
+	air_pred = true,
+	air_pred_mul = 2.25,
+	air_intercept = true,
 	ff_check = true,
 	stomp = true,
 	tp_back = true,
@@ -65,8 +70,8 @@ local cfg = {
 	anti_loop_jitter = true,
 	anti_loop_vel = false,
 	chase = true,
-	attach_lead = 0.04,
-	sticky_speed = 30,
+	attach_lead = 0.12,
+	sticky_speed = 90,
 	hit_tracers = true,
 	tracer_life = 0.55,
 	tracer_color = DEFAULT_TRACER_COLOR,
@@ -440,6 +445,113 @@ local function get_part_vel(part)
 	return vx, vy, vz
 end
 
+local function humanoid_of(plr)
+	if not plr then
+		return nil
+	end
+	local m = hc_model(plr)
+	if m then
+		local hum = m:FindFirstChildOfClass("Humanoid")
+		if hum then
+			return hum
+		end
+	end
+	if plr.Character then
+		return plr.Character:FindFirstChildOfClass("Humanoid")
+	end
+	return nil
+end
+
+local HIST_MAX = 14
+
+local function clamp_n(n, lo, hi)
+	if n < lo then
+		return lo
+	end
+	if n > hi then
+		return hi
+	end
+	return n
+end
+
+local function detect_airborne(plr, part, vx, vy, vz, speed)
+	local abs_vy = math.abs(vy or 0)
+	speed = speed or 0
+	if abs_vy >= 10 or speed >= 32 then
+		return true
+	end
+
+	local hum = humanoid_of(plr)
+	if hum then
+		local air = false
+		pcall(function()
+			if hum.FloorMaterial == Enum.Material.Air then
+				air = true
+			end
+		end)
+		if air then
+			return true
+		end
+		pcall(function()
+			local st = hum:GetState()
+			if st == Enum.HumanoidStateType.Freefall
+				or st == Enum.HumanoidStateType.Flying
+				or st == Enum.HumanoidStateType.Jumping
+				or st == Enum.HumanoidStateType.FallingDown
+			then
+				air = true
+			end
+		end)
+		if air then
+			return true
+		end
+	end
+
+	if part and abs_vy >= 6 and speed >= 18 then
+		return true
+	end
+	return false
+end
+
+local function push_hist(tr, x, y, z, t)
+	local h = tr.hist
+	if not h then
+		h = {}
+		tr.hist = h
+	end
+	h[#h + 1] = { x = x, y = y, z = z, t = t }
+	while #h > HIST_MAX do
+		table.remove(h, 1)
+	end
+end
+
+local function hist_velocity(tr)
+	local h = tr.hist
+	if not h or #h < 3 then
+		return nil
+	end
+	local newest = h[#h]
+	local oldest = h[1]
+	for i = #h - 1, 1, -1 do
+		if newest.t - h[i].t >= 0.12 then
+			oldest = h[i]
+			break
+		end
+	end
+	local dt = newest.t - oldest.t
+	if dt < 0.03 then
+		return nil
+	end
+	local dx = newest.x - oldest.x
+	local dy = newest.y - oldest.y
+	local dz = newest.z - oldest.z
+	local mag = math.sqrt(dx * dx + dy * dy + dz * dz)
+	if mag > 700 then
+		return nil
+	end
+	return dx / dt, dy / dt, dz / dt, mag / dt
+end
+
 local function update_target_track(plr, part, now)
 	if not plr or not part then
 		return nil
@@ -458,19 +570,33 @@ local function update_target_track(plr, part, now)
 			vx = 0,
 			vy = 0,
 			vz = 0,
+			ax = 0,
+			ay = 0,
+			az = 0,
 			speed = 0,
+			h_speed = 0,
+			air = false,
+			air_streak = 0,
+			fast_air = false,
 			t = now,
 			spike = false,
+			hist = {},
 		}
+		push_hist(tr, pos.X, pos.Y, pos.Z, now)
 		target_tracks[key] = tr
 		return tr
 	end
 
 	local dt = now - tr.t
-	if dt <= 0.001 or dt > 0.5 then
+	if dt <= 0.001 then
+		return tr
+	end
+	if dt > 0.55 then
 		tr.px, tr.py, tr.pz = pos.X, pos.Y, pos.Z
 		tr.t = now
 		tr.spike = false
+		tr.hist = {}
+		push_hist(tr, pos.X, pos.Y, pos.Z, now)
 		return tr
 	end
 
@@ -480,34 +606,122 @@ local function update_target_track(plr, part, now)
 	local mag = math.sqrt(dx * dx + dy * dy + dz * dz)
 	tr.t = now
 	tr.px, tr.py, tr.pz = pos.X, pos.Y, pos.Z
+	push_hist(tr, pos.X, pos.Y, pos.Z, now)
 
-	if mag >= 500 or (typeof(pos.Y) == "number" and pos.Y < -50000) then
+	if mag >= 650 or (typeof(pos.Y) == "number" and pos.Y < -50000) then
 		tr.spike = true
-		tr.vx, tr.vy, tr.vz, tr.speed = 0, 0, 0, 0
-		return tr
-	end
-
-	tr.spike = mag >= 55
-	if tr.spike then
-		tr.vx, tr.vy, tr.vz, tr.speed = 0, 0, 0, 0
+		tr.hist = {}
+		push_hist(tr, pos.X, pos.Y, pos.Z, now)
 		return tr
 	end
 
 	local ivx, ivy, ivz = dx / dt, dy / dt, dz / dt
+	local sample_speed = math.sqrt(ivx * ivx + ivy * ivy + ivz * ivz)
+
+	-- Soft spike only for true teleports. Fast CFrame fly can move 100+ studs/frame.
+	local spike_cut = math.max(120, (tr.speed or 0) * 0.85 + 80)
+	if tr.air or sample_speed > 55 then
+		spike_cut = math.max(spike_cut, 280)
+	end
+	if mag >= spike_cut and sample_speed > 450 then
+		tr.spike = true
+		return tr
+	end
+	tr.spike = false
+	local hvx, hvy, hvz, hspeed = hist_velocity(tr)
+	if hvx then
+		ivx = hvx * 0.72 + ivx * 0.28
+		ivy = hvy * 0.72 + ivy * 0.28
+		ivz = hvz * 0.72 + ivz * 0.28
+		sample_speed = hspeed or sample_speed
+	end
+
 	local avx, avy, avz = get_part_vel(part)
 	local av_speed = math.sqrt(avx * avx + avy * avy + avz * avz)
 	if av_speed > 2 and av_speed < 400 then
-		ivx = ivx * 0.45 + avx * 0.55
-		ivy = ivy * 0.45 + avy * 0.55
-		ivz = ivz * 0.45 + avz * 0.55
+		local trust_asm = 0.12
+		if not detect_airborne(plr, part, ivx, ivy, ivz, sample_speed) and sample_speed < 40 then
+			trust_asm = 0.4
+		end
+		local trust_delta = 1 - trust_asm
+		ivx = ivx * trust_delta + avx * trust_asm
+		ivy = ivy * trust_delta + avy * trust_asm
+		ivz = ivz * trust_delta + avz * trust_asm
 	end
 
-	tr.vx = tr.vx * 0.55 + ivx * 0.45
-	tr.vy = tr.vy * 0.55 + ivy * 0.45
-	tr.vz = tr.vz * 0.55 + ivz * 0.45
-	tr.speed = math.sqrt(tr.vx * tr.vx + tr.vz * tr.vz)
+	local prev_vx, prev_vy, prev_vz = tr.vx, tr.vy, tr.vz
+	local air_guess = detect_airborne(plr, part, ivx, ivy, ivz, sample_speed) or tr.air or sample_speed > 38
+	local blend = air_guess and 0.88 or 0.5
+	local keep = 1 - blend
+	tr.vx = prev_vx * keep + ivx * blend
+	tr.vy = prev_vy * keep + ivy * blend
+	tr.vz = prev_vz * keep + ivz * blend
+
+	local inv_dt = 1 / math.max(dt, 0.008)
+	local raw_ax = (tr.vx - prev_vx) * inv_dt
+	local raw_ay = (tr.vy - prev_vy) * inv_dt
+	local raw_az = (tr.vz - prev_vz) * inv_dt
+	local a_blend = air_guess and 0.62 or 0.32
+	tr.ax = tr.ax * (1 - a_blend) + raw_ax * a_blend
+	tr.ay = tr.ay * (1 - a_blend) + raw_ay * a_blend
+	tr.az = tr.az * (1 - a_blend) + raw_az * a_blend
+
+	local a_cap = air_guess and 520 or 280
+	tr.ax = clamp_n(tr.ax, -a_cap, a_cap)
+	tr.ay = clamp_n(tr.ay, -a_cap, a_cap)
+	tr.az = clamp_n(tr.az, -a_cap, a_cap)
+
+	tr.h_speed = math.sqrt(tr.vx * tr.vx + tr.vz * tr.vz)
+	tr.speed = math.sqrt(tr.vx * tr.vx + tr.vy * tr.vy + tr.vz * tr.vz)
+	tr.air = detect_airborne(plr, part, tr.vx, tr.vy, tr.vz, tr.speed) or tr.speed >= 36
+	if tr.air then
+		tr.air_streak = math.min((tr.air_streak or 0) + 1, 180)
+	else
+		tr.air_streak = math.max((tr.air_streak or 0) - 3, 0)
+		if tr.air_streak > 0 then
+			tr.air = true
+		end
+	end
+	tr.fast_air = tr.air and tr.speed >= 28
 	tr.sx, tr.sy, tr.sz = pos.X, pos.Y, pos.Z
 	return tr
+end
+
+local function extrapolate_pos(x, y, z, tr, lead)
+	if not tr or lead <= 0 then
+		return x, y, z
+	end
+	local half = 0.5 * lead * lead
+	local use_accel = cfg.air_pred and (tr.air or tr.speed > 30)
+	local ax = use_accel and (tr.ax or 0) or 0
+	local ay = use_accel and (tr.ay or 0) or 0
+	local az = use_accel and (tr.az or 0) or 0
+	return x + (tr.vx or 0) * lead + ax * half,
+		y + (tr.vy or 0) * lead + ay * half,
+		z + (tr.vz or 0) * lead + az * half
+end
+
+local function air_intercept_time(tr, base_lead)
+	base_lead = base_lead or cfg.attach_lead or 0.16
+	if not tr or not cfg.air_pred then
+		return base_lead
+	end
+	local speed = tr.speed or 0
+	local mul = cfg.air_pred_mul or 2.25
+	if not (tr.air or tr.fast_air or speed > 34) then
+		return base_lead * (speed > 28 and 1.2 or 1)
+	end
+
+	-- Calculate where they'll be: longer look-ahead as fly speed rises.
+	local t = base_lead * mul
+	t = t + speed / 220
+	if math.abs(tr.vy or 0) > 20 then
+		t = t + math.min(0.18, math.abs(tr.vy) / 400)
+	end
+	if cfg.air_intercept ~= false then
+		t = math.max(t, 0.18 + speed / 280)
+	end
+	return clamp_n(t, 0.1, 0.85)
 end
 
 local function resolved_target_pos(plr, part, now, lead)
@@ -518,24 +732,40 @@ local function resolved_target_pos(plr, part, now, lead)
 	end
 
 	if cfg.chase then
-		if tr.spike or (typeof(py) == "number" and py < -50000) then
+		if typeof(py) == "number" and py < -50000 then
 			px, py, pz = tr.sx, tr.sy, tr.sz
 		end
-		lead = lead or 0
-		if lead > 0 and not tr.spike then
-			px = px + tr.vx * lead
-			py = py + tr.vy * lead * 0.35
-			pz = pz + tr.vz * lead
+		local t = lead or 0
+		if t > 0 and (tr.air or tr.fast_air or (tr.speed or 0) > 30) then
+			t = air_intercept_time(tr, t)
+		elseif t > 0 and cfg.air_pred then
+			t = t * (1 + math.min(1.2, (tr.speed or 0) / 70))
+		end
+		if t > 0 then
+			px, py, pz = extrapolate_pos(px, py, pz, tr, t)
 		end
 	end
-	return px, py, pz, tr.speed or 0
+	return px, py, pz, tr.speed or 0, tr
 end
 
-local function apply_cf(cf)
+-- carry_vel = ride with target between frames (zeroing velocity causes the desync lag).
+local function apply_cf(cf, carry_vel)
 	if not cf then
 		return false
 	end
 	local ok = false
+	local px, py, pz = cf.X, cf.Y, cf.Z
+	pcall(function()
+		local p = cf.Position
+		px, py, pz = p.X, p.Y, p.Z
+	end)
+	local vx, vy, vz = 0, 0, 0
+	if carry_vel then
+		vx = carry_vel.X or carry_vel[1] or 0
+		vy = carry_vel.Y or carry_vel[2] or 0
+		vz = carry_vel.Z or carry_vel[3] or 0
+	end
+	local vel = Vector3.new(vx, vy, vz)
 	local zero = Vector3.new()
 	local function write(part)
 		if not part then
@@ -543,24 +773,73 @@ local function apply_cf(cf)
 		end
 		pcall(function()
 			part.CFrame = cf
-			part.AssemblyLinearVelocity = zero
+		end)
+		pcall(function()
+			part.Position = Vector3.new(px, py, pz)
+		end)
+		pcall(function()
+			part.AssemblyLinearVelocity = vel
 			part.AssemblyAngularVelocity = zero
 		end)
 		pcall(function()
-			part.Velocity = zero
+			part.Velocity = vel
 			part.RotVelocity = zero
 		end)
 		ok = true
 	end
-	local me = hrp(LP)
-	write(me)
 	if LP.Character then
+		local hum = LP.Character:FindFirstChildOfClass("Humanoid")
+		local root = hum and hum.RootPart
+		if root then
+			write(root)
+		end
 		local char_hrp = LP.Character:FindFirstChild("HumanoidRootPart")
-		if char_hrp and char_hrp ~= me then
+		if char_hrp then
 			write(char_hrp)
 		end
 	end
+	local me = hrp(LP)
+	write(me)
 	return ok
+end
+
+-- target.CFrame * CFrame.new(ox,oy,oz) — sticks with flyers (no PhysicsRepRootPart on Matcha).
+local function mul_offset(tcf, ox, oy, oz)
+	local ok, out = pcall(function()
+		return tcf * CFrame.new(ox, oy, oz)
+	end)
+	if ok and out then
+		return out
+	end
+	local p = tcf.Position
+	local r, u, l = tcf.RightVector, tcf.UpVector, tcf.LookVector
+	return cf_xyz(
+		p.X + r.X * ox + u.X * oy - l.X * oz,
+		p.Y + r.Y * ox + u.Y * oy - l.Y * oz,
+		p.Z + r.Z * ox + u.Z * oy - l.Z * oz
+	)
+end
+
+-- Visual Character root first (SpecialParts often lags behind what you see).
+local function get_stick_part(plr)
+	if plr.Character then
+		local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+		if hum and hum.RootPart then
+			return hum.RootPart
+		end
+		local ch = plr.Character:FindFirstChild("HumanoidRootPart")
+		if ch then
+			return ch
+		end
+	end
+	local m = hc_model(plr)
+	if m then
+		local p = m:FindFirstChild("HumanoidRootPart")
+		if p then
+			return p
+		end
+	end
+	return hrp(plr)
 end
 
 local function rage_active()
@@ -854,32 +1133,128 @@ local function apply_void_hide(base_cf, now, force_anti)
 	return true, force_anti and "anti-loop" or "void"
 end
 
-local function attach_cf(target_hrp, mode, aim_x, aim_y, aim_z)
-	if not target_hrp then
-		return nil
+local function snap_attach(target)
+	if not target or not cfg.tp or dead(target) then
+		return false
 	end
-	local tpos = target_hrp.Position
-	local tx = aim_x or tpos.X
-	local ty = aim_y or tpos.Y
-	local tz = aim_z or tpos.Z
-	local tcf = target_hrp.CFrame
+	-- Stick to visible Character (SpecialParts lag is what felt like desync).
+	local th = get_stick_part(target) or hrp(target)
+	if not th then
+		return false
+	end
+
+	local me = nil
+	if LP.Character then
+		local hum = LP.Character:FindFirstChildOfClass("Humanoid")
+		me = (hum and hum.RootPart) or LP.Character:FindFirstChild("HumanoidRootPart")
+	end
+	me = me or hrp(LP)
+	remember_return_cf(me)
+
+	local now = tick()
+	local tr = update_target_track(target, th, now)
+	local tpos = th.Position
+	local tcf = th.CFrame
+
+	-- Velocity: history track first (CFrame fly), asm as backup.
+	local ivx, ivy, ivz = 0, 0, 0
+	if tr and not tr.spike then
+		ivx, ivy, ivz = tr.vx or 0, tr.vy or 0, tr.vz or 0
+	end
+	local avx, avy, avz = get_part_vel(th)
+	local aspeed = math.sqrt(avx * avx + avy * avy + avz * avz)
+	local tspeed = math.sqrt(ivx * ivx + ivy * ivy + ivz * ivz)
+	if tspeed < 4 and aspeed > tspeed then
+		ivx, ivy, ivz = avx, avy, avz
+		tspeed = aspeed
+	elseif aspeed > 2 and aspeed < 400 and tspeed > 4 then
+		ivx = ivx * 0.85 + avx * 0.15
+		ivy = ivy * 0.85 + avy * 0.15
+		ivz = ivz * 0.85 + avz * 0.15
+		tspeed = math.sqrt(ivx * ivx + ivy * ivy + ivz * ivz)
+	end
+
+	local mx, my, mz = tpos.X, tpos.Y, tpos.Z
+	if me then
+		local mp = me.Position
+		mx, my, mz = mp.X, mp.Y, mp.Z
+	end
+	local dx, dy, dz = tpos.X - mx, tpos.Y - my, tpos.Z - mz
+	local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+	local behind = 0
+	local ahead = 0
+	if tspeed > 1 then
+		local inv = 1 / tspeed
+		local along = (dx * ivx + dy * ivy + dz * ivz) * inv
+		-- along > 0 means target is ahead of us in their move dir (we're behind).
+		if along > 0 then
+			behind = along
+		else
+			ahead = -along
+		end
+	end
+
+	local catching = dist > 5 or behind > 2.5 or tspeed > 35
+	local locked = dist < 4 and ahead < 3
+	local catch_pow = clamp_n((cfg.sticky_speed or 90) / 30, 0.8, 5)
+	local base_lead = cfg.attach_lead or 0.12
+	local rep_lead = 0
+	if catching and not locked then
+		rep_lead = base_lead * 1.8 * catch_pow + tspeed / 1000 + dist / 260 + behind / 90
+		rep_lead = clamp_n(rep_lead, 0.08, 0.42)
+	elseif tspeed > 8 then
+		-- Locked-on: small lead only — big lead causes overshoot jitter.
+		rep_lead = clamp_n(base_lead * 0.55 * catch_pow + tspeed / 2200, 0.02, 0.14)
+	end
+
 	local h = cfg.radius or 3
-	local v = cfg.y or 2
-	local speed = cfg.strafe_speed or 50
-	mode = mode or "Sticky"
+	if h < 0.5 then
+		h = 0.5
+	end
+	local v = cfg.y or 0
+	local mode = cfg.tp_mode or "Sticky"
+	local use_mode = mode
+	if catching and (mode == "Orbit" or mode == "Strafe" or mode == "Random teleport" or mode == "Random") then
+		use_mode = "Sticky"
+	end
 
-	local nx, ny, nz = tx, ty + v, tz
-	local yaw = 0
+	-- Predict THEIR position first, then apply offset in their axes (no double-lead).
+	local ax = (tr and not tr.spike and tr.ax) or 0
+	local ay = (tr and not tr.spike and tr.ay) or 0
+	local az = (tr and not tr.spike and tr.az) or 0
+	local half = 0.5 * rep_lead * rep_lead
+	local px = tpos.X + ivx * rep_lead + ax * half
+	local py = tpos.Y + ivy * rep_lead + ay * half
+	local pz = tpos.Z + ivz * rep_lead + az * half
 
-	if mode == "Sticky" then
-		nx, ny, nz = tx, ty + v, tz
-	elseif mode == "Strafe" or mode == "Orbit" then
-		yaw = math.fmod(tick() * speed * 0.35, math.pi * 2)
-		local off = (CFrame.Angles(0, yaw, 0) * CFrame.new(0, 0, h)).Position
-		nx, ny, nz = tx + off.X, ty + v, tz + off.Z
-	elseif mode == "Random teleport" or mode == "Random" then
-		local now = tick()
-		if (not last_random_off) or (now - last_random_t) >= 0.1 then
+	local r, u, l = tcf.RightVector, tcf.UpVector, tcf.LookVector
+	local ox, oy, oz = 0, v, h
+	if use_mode == "Sticky" or use_mode == "Behind" then
+		-- Catch = sit on them; locked = use full offset.
+		oz = catching and math.min(h, 1.1) or h
+		oy = catching and v * 0.35 or v
+	elseif use_mode == "In Front" then
+		oz = -(catching and math.min(h, 1.1) or h)
+	elseif use_mode == "Above" then
+		ox, oy, oz = 0, (catching and math.min(h, 2) or h) + v, 0
+	elseif use_mode == "Orbit" or use_mode == "Strafe" then
+		if orbit_last_t <= 0 then
+			orbit_last_t = now
+		end
+		local dt = now - orbit_last_t
+		if dt < 0 then
+			dt = 0
+		elseif dt > 0.05 then
+			dt = 0.05
+		end
+		orbit_last_t = now
+		orbit_angle = orbit_angle + (cfg.strafe_speed or 50) * 0.35 * dt
+		ox = math.cos(orbit_angle) * h
+		oy = v
+		oz = math.sin(orbit_angle) * h
+	elseif use_mode == "Random teleport" or use_mode == "Random" then
+		if (not last_random_off) or (now - last_random_t) >= 0.08 then
 			last_random_off = {
 				x = (math.random() * 2 - 1) * h,
 				y = (math.random() * 2 - 1) * math.min(math.abs(v), 3),
@@ -887,58 +1262,26 @@ local function attach_cf(target_hrp, mode, aim_x, aim_y, aim_z)
 			}
 			last_random_t = now
 		end
-		nx = tx - last_random_off.x
-		ny = ty + v - last_random_off.y
-		nz = tz - last_random_off.z
-	elseif mode == "Behind" then
-		local lv = tcf.LookVector
-		nx, ny, nz = tx - lv.X * h, ty + v, tz - lv.Z * h
-	elseif mode == "In Front" then
-		local lv = tcf.LookVector
-		nx, ny, nz = tx + lv.X * h, ty + v, tz + lv.Z * h
-	elseif mode == "Above" then
-		nx, ny, nz = tx, ty + h + v, tz
+		ox, oy, oz = last_random_off.x, v + last_random_off.y, last_random_off.z
 	end
 
-	local look = Vector3.new(tx, ty, tz)
+	-- Object offset: +X right, +Y up, +Z behind ( -LookVector ).
+	local wx = px + r.X * ox + u.X * oy - l.X * oz
+	local wy = py + r.Y * ox + u.Y * oy - l.Y * oz
+	local wz = pz + r.Z * ox + u.Z * oy - l.Z * oz
+
+	local cf = cf_xyz(wx, wy, wz)
 	if cfg.face then
-		return cf_look(Vector3.new(nx, ny, nz), look)
-	end
-	if mode == "Strafe" or mode == "Orbit" then
-		return cf_xyz(nx, ny, nz) * CFrame.Angles(0, yaw, 0)
-	end
-	return cf_xyz(nx, ny, nz)
-end
-
-local function snap_attach(target)
-	if not target or not cfg.tp or dead(target) then
-		return false
-	end
-	local th = hrp(target)
-	if not th then
-		return false
+		cf = cf_look(Vector3.new(wx, wy, wz), Vector3.new(px, py, pz))
 	end
 
-	local me = hrp(LP)
-	remember_return_cf(me)
-
-	local tx, ty, tz = th.Position.X, th.Position.Y, th.Position.Z
-	if cfg.chase then
-		local tr = update_target_track(target, th, tick())
-		if tr and not tr.spike then
-			local lead = cfg.attach_lead or 0.04
-			tx = tx + (tr.vx or 0) * lead
-			ty = ty + (tr.vy or 0) * lead * 0.2
-			tz = tz + (tr.vz or 0) * lead
-		end
+	local mul = 1.05
+	if catching and not locked then
+		mul = 1.2 + math.min(0.75, catch_pow * 0.12)
 	end
-
-	local cf = attach_cf(th, cfg.tp_mode or "Sticky", tx, ty, tz)
-	if not cf then
-		return false
-	end
-
-	apply_cf(cf)
+	local carry = Vector3.new(ivx * mul, ivy * mul, ivz * mul)
+	apply_cf(cf, carry)
+	apply_cf(cf, carry)
 	lplr_pos = cf
 	active_attach_target = target
 	return true
@@ -1136,43 +1479,6 @@ local function update_hit_tracers()
 	end
 end
 
-local function make_hit(part, pred, track_vel)
-	local center = part.Position
-	local hit_pos = center
-	local vx, vy, vz = 0, 0, 0
-
-	pred = pred or 0
-	if pred > 0 then
-		vx, vy, vz = get_part_vel(part)
-		local part_speed = math.sqrt(vx * vx + vy * vy + vz * vz)
-		if track_vel and (part_speed < 4 or part_speed > 500) then
-			vx = track_vel.vx or 0
-			vy = track_vel.vy or 0
-			vz = track_vel.vz or 0
-		elseif track_vel and track_vel.speed and track_vel.speed > part_speed then
-			vx = vx * 0.35 + (track_vel.vx or 0) * 0.65
-			vy = vy * 0.35 + (track_vel.vy or 0) * 0.65
-			vz = vz * 0.35 + (track_vel.vz or 0) * 0.65
-		end
-		hit_pos = Vector3.new(center.X + vx * pred, center.Y + vy * pred, center.Z + vz * pred)
-		local dx = hit_pos.X - center.X
-		local dy = hit_pos.Y - center.Y
-		local dz = hit_pos.Z - center.Z
-		local d = math.sqrt(dx * dx + dy * dy + dz * dz)
-		local max_off = cfg.chase and 1.6 or 0.9
-		if d > max_off and d > 0 then
-			local s = max_off / d
-			hit_pos = Vector3.new(center.X + dx * s, center.Y + dy * s, center.Z + dz * s)
-		end
-	end
-
-	local offset = Vector3.new(0, 0, 0)
-	pcall(function()
-		offset = part.CFrame:PointToObjectSpace(hit_pos)
-	end)
-	return hit_pos, offset
-end
-
 local function fire_mouse_pos(pos)
 	event = event or get_main_event()
 	if not event or not pos then
@@ -1184,10 +1490,36 @@ local function fire_mouse_pos(pos)
 	end)
 end
 
-local function build_shoot_payload(part, pred, track_vel)
-	local hit_pos, offset = make_hit(part, pred, track_vel)
-	local gun_origin = get_gun_origin()
-	local origin = gun_origin or select(1, shoot_origin())
+-- Exact dump shape from your spy:
+-- MainEvent:FireServer("Shoot", {
+--   { { Position, Normal, Instance = SpecialParts.HRP } },
+--   { { thePart = SpecialParts.HRP, theOffset = Vector3(-0.57, 0.01, -0.30) } },
+--   origin, endPos, serverTime
+-- })
+local function build_shoot_payload(part)
+	if not part then
+		return nil
+	end
+
+	-- Match dump offset (small in-part hit, not center / not multi-part).
+	local offset = Vector3.new(-0.57, 0.01, -0.30)
+	local hit_pos = part.Position
+	pcall(function()
+		hit_pos = part.CFrame:PointToWorldSpace(offset)
+	end)
+
+	-- Origin MUST stay near local character (server check). Far fake muzzle breaks sticky.
+	local origin = get_gun_origin()
+	local me = nil
+	if LP.Character then
+		local hum = LP.Character:FindFirstChildOfClass("Humanoid")
+		me = (hum and hum.RootPart) or LP.Character:FindFirstChild("HumanoidRootPart")
+	end
+	me = me or hrp(LP)
+	if not origin and me then
+		local lv = me.CFrame.LookVector
+		origin = Vector3.new(me.Position.X + lv.X * 2, me.Position.Y + 1.4, me.Position.Z + lv.Z * 2)
+	end
 	if not origin then
 		return nil
 	end
@@ -1196,48 +1528,21 @@ local function build_shoot_payload(part, pred, track_vel)
 	local dy = hit_pos.Y - origin.Y
 	local dz = hit_pos.Z - origin.Z
 	local mag = math.sqrt(dx * dx + dy * dy + dz * dz)
-
-	if mag < 3 then
-		local me = hrp(LP)
-		local back = Vector3.new(0, 0, -1)
-		pcall(function()
-			if me then
-				local lv = me.CFrame.LookVector
-				back = Vector3.new(lv.X, lv.Y * 0.25, lv.Z)
-				if back.Magnitude < 0.05 then
-					back = Vector3.new(0, 0, -1)
-				else
-					back = back.Unit
-				end
-			end
-		end)
-		origin = Vector3.new(hit_pos.X - back.X * 8, hit_pos.Y - back.Y * 8 + 1, hit_pos.Z - back.Z * 8)
+	-- Only nudge muzzle a few studs if overlapping the hit (keep near character).
+	if mag < 1.25 and me then
+		local lv = me.CFrame.LookVector
+		origin = Vector3.new(hit_pos.X - lv.X * 3.5, hit_pos.Y + 1.2, hit_pos.Z - lv.Z * 3.5)
 		dx = hit_pos.X - origin.X
 		dy = hit_pos.Y - origin.Y
 		dz = hit_pos.Z - origin.Z
 		mag = math.sqrt(dx * dx + dy * dy + dz * dz)
 	end
-
 	if mag < 0.001 then
 		dx, dy, dz, mag = 0, 0, -1, 1
 	end
 	local ux, uy, uz = dx / mag, dy / mag, dz / mag
 
-	local tracer_to = hit_pos
-	pcall(function()
-		tracer_to = part.Position
-	end)
-	local tracer_from = gun_origin or origin
-	if gun_origin and tracer_to then
-		local gx = tracer_to.X - gun_origin.X
-		local gy = tracer_to.Y - gun_origin.Y
-		local gz = tracer_to.Z - gun_origin.Z
-		if math.sqrt(gx * gx + gy * gy + gz * gz) < 2.5 then
-			tracer_from = origin
-		end
-	end
-
-	return {
+	local payload = {
 		{
 			{
 				Position = hit_pos,
@@ -1254,32 +1559,25 @@ local function build_shoot_payload(part, pred, track_vel)
 		origin,
 		Vector3.new(hit_pos.X + ux * 80, hit_pos.Y + uy * 80, hit_pos.Z + uz * 80),
 		server_time(),
-	}, hit_pos, tracer_from, tracer_to
+	}
+	return payload, hit_pos, origin
 end
 
-local function fire_shoot(part, pred, track_vel, times)
+local function fire_shoot(part, times)
 	event = event or get_main_event()
 	if not event or not part then
 		remote_status = event and "no part" or "no MainEvent"
 		return false
 	end
 
-	local parent_ok = false
+	local alive = false
 	pcall(function()
-		parent_ok = part.Parent ~= nil
+		alive = part.Parent ~= nil
 	end)
-	if not parent_ok then
+	if not alive then
 		remote_status = "stale part"
 		return false
 	end
-
-	local payload, hit_pos, tracer_from, tracer_to = build_shoot_payload(part, pred, track_vel)
-	if not payload then
-		remote_status = "no origin"
-		return false
-	end
-
-	fire_mouse_pos(hit_pos)
 
 	times = times or 1
 	if times < 1 then
@@ -1289,44 +1587,47 @@ local function fire_shoot(part, pred, track_vel, times)
 	local ok_any = false
 	local err
 	local fired = 0
+	local last_hit, last_origin
+	local form = "?"
+
 	for _ = 1, times do
-		local ok, e = pcall(function()
+		local payload, hit_pos, origin = build_shoot_payload(part)
+		if not payload then
+			remote_status = "no origin"
+			return false
+		end
+		last_hit, last_origin = hit_pos, origin
+		fire_mouse_pos(hit_pos)
+
+		-- Fire BOTH forms every shot (Matcha / spy packing differs).
+		local ok1, e1 = pcall(function()
 			event:FireServer("Shoot", payload)
 		end)
-		if ok then
+		local ok2, e2 = pcall(function()
+			event:FireServer("Shoot", payload[1], payload[2], payload[3], payload[4], payload[5])
+		end)
+		if ok1 or ok2 then
 			ok_any = true
 			fired = fired + 1
+			form = (ok1 and ok2 and "both") or (ok1 and "table") or "args"
 		else
-			err = e
-			ok, e = pcall(function()
-				event:FireServer("Shoot", payload[1], payload[2], payload[3], payload[4], payload[5])
-			end)
-			if ok then
-				ok_any = true
-				fired = fired + 1
-			else
-				err = e
-			end
+			err = e2 or e1
 		end
 	end
 
 	if ok_any then
 		shoot_fail_streak = 0
-		remote_status = "Shoot x" .. tostring(fired) .. " → " .. part.Name
-		if fired > 0 then
-			local from = tracer_from or payload[3]
-			local to = tracer_to or hit_pos
-			if from and to then
-				add_hit_tracer(from, to)
-			end
+		remote_status = "Shoot/" .. form .. " x" .. tostring(fired) .. " → " .. part.Name
+		if last_origin and last_hit then
+			add_hit_tracer(last_origin, last_hit)
 		end
-		return true, hit_pos
+		return true, last_hit
 	end
 
 	shoot_fail_streak = shoot_fail_streak + 1
 	event = get_main_event()
 	remote_status = "Shoot FAIL " .. tostring(err)
-	return false, hit_pos
+	return false, last_hit
 end
 
 local function rage_shoot_target(target)
@@ -1337,32 +1638,77 @@ local function rage_shoot_target(target)
 		remote_status = "ForceField — waiting"
 		return false
 	end
-	local hitbox = cfg.hitbox or "Head"
-	local aim = aim_part(target, hitbox)
-	if not aim then
+
+	local now = tick()
+	if (now - last_shoot) < 0.016 then
 		return false
 	end
-	local track = target_tracks[track_key(target)]
-	local burst = cfg.burst or 4
+
+	-- Damage part = SpecialParts only (your dump).
+	local s = special(target)
+	if not s or s.Name ~= "SpecialParts" then
+		-- special() can fall back to whole model — require real SpecialParts folder.
+		local m = hc_model(target)
+		s = m and m:FindFirstChild("SpecialParts")
+	end
+	if not s then
+		remote_status = "no SpecialParts"
+		return false
+	end
+
+	local hitbox = cfg.hitbox or "HumanoidRootPart"
+	local aim = find_part(s, hitbox)
+		or find_part(s, "HumanoidRootPart")
+		or find_part(s, "Head")
+		or find_part(s, "UpperTorso")
+	if not aim then
+		remote_status = "no SpecialParts hitbox"
+		return false
+	end
+
+	-- Confirm path looks like dump: ...Characters.<name>.SpecialParts.<part>
+	local path_ok = false
+	pcall(function()
+		path_ok = aim:IsDescendantOf(chars_folder())
+	end)
+
+	local burst = cfg.burst or 6
 	if burst < 1 then
 		burst = 1
 	end
-	return fire_shoot(aim, cfg.pred or 0.06, track, burst)
+	last_shoot = now
+	local ok = fire_shoot(aim, burst)
+	if ok and not path_ok then
+		remote_status = tostring(remote_status) .. " (warn: not under Characters)"
+	end
+	return ok
 end
 
-local function on_attach_render()
-	update_hit_tracers()
-	if not running or not rage_active() then
+-- Lean stick loop — no shoot/UI work, max frequency.
+local function on_stick_step()
+	if not running or not rage_active() or not cfg.tp then
 		return
 	end
 	local target = active_attach_target
 	if not target or dead(target) then
-		return
+		target = pick_primary(true, true) or pick_primary(true, false) or pick_primary(false)
+		active_attach_target = target
 	end
-	if cfg.tp then
+	if target and not dead(target) then
 		snap_attach(target)
 	end
-	rage_shoot_target(target)
+end
+
+local function on_attach_render()
+	update_hit_tracers()
+	on_stick_step()
+	if not running or not rage_active() then
+		return
+	end
+	local target = active_attach_target
+	if target and not dead(target) then
+		rage_shoot_target(target)
+	end
 end
 
 local function fire_stomp()
@@ -1500,13 +1846,16 @@ end)
 tp:Toggle("Chase Resolve", true, function(on)
 	cfg.chase = on == true
 end)
-tp:Slider("Attach Lead", 0.04, 0.01, 0, 0.35, "s", function(v)
+tp:Slider("Attach Lead", 0.12, 0.01, 0, 0.45, "s", function(v)
 	cfg.attach_lead = v
 end)
-tp:Slider("Sticky Speed", 30, 1, 10, 120, "", function(v)
+tp:Toggle("Air Intercept", true, function(on)
+	cfg.air_intercept = on == true
+end)
+tp:Slider("Catch Power", 90, 5, 10, 150, "", function(v)
 	cfg.sticky_speed = v
 end)
-tp:Info("Sticky = hard lock on target every Render + Heartbeat. Small offset = faster stick.")
+tp:Info("Sticks to visible Character (not laggy SpecialParts). Catch Power high = faster catch; lowers lead when locked.")
 
 local shoot = tab:Section("Shoot", "Right", "MainEvent Shoot")
 shoot:Toggle("Fire Shoot Remote", true, function(on)
@@ -1515,17 +1864,23 @@ end)
 shoot:Toggle("ForceField Check", true, function(on)
 	cfg.ff_check = on == true
 end)
-shoot:Dropdown("Hitbox", { "Head" }, HITBOXES, false, function(v)
-	cfg.hitbox = (v and v[1]) or "Head"
+shoot:Dropdown("Hitbox", { "HumanoidRootPart" }, HITBOXES, false, function(v)
+	cfg.hitbox = (v and v[1]) or "HumanoidRootPart"
 end)
-shoot:Info("Head / UpperTorso = most reliable full hits on SpecialParts")
-shoot:Slider("Burst", 4, 1, 1, 12, "", function(v)
+shoot:Info("Exact dump: SpecialParts part + offset (-0.57,0.01,-0.30), origin near YOU (not 55-stud fake).")
+shoot:Slider("Burst", 6, 1, 1, 16, "", function(v)
 	cfg.burst = v
 end)
-shoot:Slider("Prediction", 0.06, 0.01, 0, 0.25, "", function(v)
+shoot:Slider("Prediction", 0.12, 0.01, 0, 0.45, "", function(v)
 	cfg.pred = v
 end)
-shoot:Info("ForceField Check skips shooting until their FF is gone")
+shoot:Toggle("Air Prediction", true, function(on)
+	cfg.air_pred = on == true
+end)
+shoot:Slider("Air Pred Mult", 2.25, 0.05, 1, 4, "x", function(v)
+	cfg.air_pred_mul = v
+end)
+shoot:Info("Shoot = MainEvent:FireServer only (no Activate). Status should show Shoot xN → part.")
 
 local fx = tab:Section("Hit Tracers", "Right", "Drawing line gun → hit part")
 fx:Toggle("Hit Tracers", true, function(on)
@@ -1649,6 +2004,18 @@ local function on_heartbeat(dt)
 	prune_selected()
 
 	local me = hrp(LP)
+
+	-- Stick FIRST so later heartbeat work can't leave you a frame behind.
+	if rage_active() and cfg.tp then
+		local early = active_attach_target
+		if not early or dead(early) then
+			early = pick_primary(true, true) or pick_primary(true, false)
+		end
+		if early and not dead(early) and not knocked(early) then
+			snap_attach(early)
+			me = hrp(LP) or me
+		end
+	end
 
 	if me then
 		if is_void_y(me.Position.Y) and void_safe_cf then
@@ -1837,7 +2204,23 @@ local function bind_signal(signal, fn, name)
 end
 
 bind_signal(RunService.Heartbeat, on_heartbeat, "Heartbeat")
+bind_signal(RunService.Heartbeat, on_stick_step, "StickHeartbeat")
 bind_signal(RunService.Heartbeat, update_hit_tracers, "TracerHeartbeat")
+pcall(function()
+	if RunService.Stepped then
+		bind_signal(RunService.Stepped, on_stick_step, "Stepped")
+	end
+end)
+pcall(function()
+	if RunService.PreSimulation then
+		bind_signal(RunService.PreSimulation, on_stick_step, "PreSimulation")
+	end
+end)
+pcall(function()
+	if RunService.PostSimulation then
+		bind_signal(RunService.PostSimulation, on_stick_step, "PostSimulation")
+	end
+end)
 local render_bound = false
 pcall(function()
 	if RunService.PreRender then
@@ -1848,6 +2231,11 @@ end)
 if not render_bound then
 	bind_signal(RunService.RenderStepped, on_attach_render, "RenderStepped")
 end
+pcall(function()
+	if RunService.RenderStepped and render_bound then
+		bind_signal(RunService.RenderStepped, on_stick_step, "StickRender")
+	end
+end)
 pcall(function()
 	if drawing_available() and typeof(WorldToScreen) == "function" then
 		print("[HC] Drawing + WorldToScreen ok — hit tracers enabled")
@@ -1900,3 +2288,4 @@ end
 pcall(function()
 	Lib:Notify("Hood Customs", "Press P for menu — multi-select Targets", 4, "success")
 end)
+print("[HC] INS ui + Heartbeat ragebot ready")
