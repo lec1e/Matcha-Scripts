@@ -16,17 +16,81 @@ local TP_MODES = { "Sticky", "Strafe", "Random teleport", "Above", "Behind", "In
 local ON_KILL_RETURNS = { "Position", "Void", "None" }
 local DEFAULT_TRACER_COLOR = Color3.fromRGB(0, 213, 255)
 
-print("[HC] load", getgamename(), LP and LP.Name)
+local GAME_KIND = "hood_customs"
+local MOUSE_ARG = "MousePosUpdate"
+local GAME_TITLE = "Hood Customs"
+
+local function detect_game()
+	local name = ""
+	pcall(function()
+		name = tostring(getgamename() or "")
+	end)
+	local gid = tostring(game.GameId)
+	local pid = tostring(game.PlaceId)
+	local lower = string.lower(name)
+
+	if gid == "3634139746" or string.find(lower, "hood custom", 1, true) then
+		return "hood_customs", "MousePosUpdate", "Hood Customs"
+	end
+	if gid == "10600465284" or string.find(lower, "des hood", 1, true) then
+		return "des_hood", "MousePos", "Des Hood"
+	end
+	if gid == "9980242798" or pid == "78871371189272" or string.find(lower, "der hood", 1, true) then
+		return "der_hood", "skid", "Der Hood"
+	end
+
+	local remotes = ReplicatedStorage:FindFirstChild("GameRemotes")
+	if remotes and remotes:FindFirstChild("MainGameEvent") then
+		return "des_hood", "MousePos", name ~= "" and name or "Des Hood"
+	end
+	if string.find(lower, "der", 1, true) and string.find(lower, "hood", 1, true) then
+		return "der_hood", "skid", name
+	end
+
+	local ws_players = Workspace:FindFirstChild("Players")
+	local has_chars = ws_players and ws_players:FindFirstChild("Characters")
+	local has_main = ReplicatedStorage:FindFirstChild("MainEvent")
+	if has_main and ws_players and not has_chars and not remotes then
+		return "der_hood", "skid", name ~= "" and name or "Der Hood"
+	end
+	return "hood_customs", "MousePosUpdate", name ~= "" and name or "Hood Copies"
+end
+
+GAME_KIND, MOUSE_ARG, GAME_TITLE = detect_game()
+
+local function is_hood_customs()
+	return GAME_KIND == "hood_customs"
+end
+
+local function is_des_hood()
+	return GAME_KIND == "des_hood"
+end
+
+local function is_der_hood()
+	return GAME_KIND == "der_hood"
+end
+
+local function uses_character_parts()
+	return not is_hood_customs()
+end
+
+print("[HC] load", GAME_TITLE, GAME_KIND, getgamename(), LP and LP.Name)
 
 local function get_main_event()
+	local remotes = ReplicatedStorage:FindFirstChild("GameRemotes")
+	local main_game = remotes and remotes:FindFirstChild("MainGameEvent")
+	if main_game then
+		return main_game
+	end
 	return ReplicatedStorage:FindFirstChild("MainEvent")
 end
 
 local event = get_main_event()
-print("[HC] event", event and event:GetFullName() or "NIL")
+print("[HC] event", event and event:GetFullName() or "NIL", "mouse", MOUSE_ARG)
 
 local running = true
 local last_shoot = 0
+local last_reload = 0
 local last_stomp = 0
 local saved_cf = nil
 local return_cf = nil
@@ -99,7 +163,11 @@ local no_void_kill_on = false
 
 local function chars_folder()
 	local p = Workspace:FindFirstChild("Players")
-	return p and p:FindFirstChild("Characters")
+	if not p then
+		return nil
+	end
+
+	return p:FindFirstChild("Characters") or p
 end
 
 local function player_names()
@@ -162,7 +230,14 @@ end
 
 local function special(plr)
 	local m = hc_model(plr)
-	return m and (m:FindFirstChild("SpecialParts") or m)
+	if not m then
+		return nil
+	end
+
+	if uses_character_parts() then
+		return m
+	end
+	return m:FindFirstChild("SpecialParts") or m
 end
 
 local function hrp(plr)
@@ -190,7 +265,11 @@ end
 
 local function body_effects(plr)
 	local m = hc_model(plr)
-	return m and m:FindFirstChild("BodyEffects")
+	local be = m and m:FindFirstChild("BodyEffects")
+	if be then
+		return be
+	end
+	return plr and plr.Character and plr.Character:FindFirstChild("BodyEffects")
 end
 
 local function find_be_flag(be, names)
@@ -231,10 +310,13 @@ local function dead_flag(plr)
 end
 
 local function knocked(plr)
-	if not plr then
+	if not plr or dead_flag(plr) then
 		return false
 	end
-	return ko_flag(plr) and not dead_flag(plr)
+	if ko_flag(plr) then
+		return true
+	end
+	return flag_true(find_be_flag(body_effects(plr), { "Grabbed", "Ragdoll", "Downed" }))
 end
 
 local function has_forcefield(plr)
@@ -618,7 +700,6 @@ local function update_target_track(plr, part, now)
 	local ivx, ivy, ivz = dx / dt, dy / dt, dz / dt
 	local sample_speed = math.sqrt(ivx * ivx + ivy * ivy + ivz * ivz)
 
-	-- Soft spike only for true teleports. Fast CFrame fly can move 100+ studs/frame.
 	local spike_cut = math.max(120, (tr.speed or 0) * 0.85 + 80)
 	if tr.air or sample_speed > 55 then
 		spike_cut = math.max(spike_cut, 280)
@@ -712,7 +793,6 @@ local function air_intercept_time(tr, base_lead)
 		return base_lead * (speed > 28 and 1.2 or 1)
 	end
 
-	-- Calculate where they'll be: longer look-ahead as fly speed rises.
 	local t = base_lead * mul
 	t = t + speed / 220
 	if math.abs(tr.vy or 0) > 20 then
@@ -748,7 +828,6 @@ local function resolved_target_pos(plr, part, now, lead)
 	return px, py, pz, tr.speed or 0, tr
 end
 
--- carry_vel = ride with target between frames (zeroing velocity causes the desync lag).
 local function apply_cf(cf, carry_vel)
 	if not cf then
 		return false
@@ -803,7 +882,6 @@ local function apply_cf(cf, carry_vel)
 	return ok
 end
 
--- target.CFrame * CFrame.new(ox,oy,oz) — sticks with flyers (no PhysicsRepRootPart on Matcha).
 local function mul_offset(tcf, ox, oy, oz)
 	local ok, out = pcall(function()
 		return tcf * CFrame.new(ox, oy, oz)
@@ -820,7 +898,6 @@ local function mul_offset(tcf, ox, oy, oz)
 	)
 end
 
--- Visual Character root first (SpecialParts often lags behind what you see).
 local function get_stick_part(plr)
 	if plr.Character then
 		local hum = plr.Character:FindFirstChildOfClass("Humanoid")
@@ -1133,112 +1210,66 @@ local function apply_void_hide(base_cf, now, force_anti)
 	return true, force_anti and "anti-loop" or "void"
 end
 
-local function snap_attach(target)
-	if not target or not cfg.tp or dead(target) then
-		return false
-	end
-	-- Stick to visible Character (SpecialParts lag is what felt like desync).
-	local th = get_stick_part(target) or hrp(target)
-	if not th then
-		return false
-	end
-
-	local me = nil
+local function ray_filter(extra)
+	local list = {}
 	if LP.Character then
-		local hum = LP.Character:FindFirstChildOfClass("Humanoid")
-		me = (hum and hum.RootPart) or LP.Character:FindFirstChild("HumanoidRootPart")
+		list[#list + 1] = LP.Character
 	end
-	me = me or hrp(LP)
-	remember_return_cf(me)
-
-	local now = tick()
-	local tr = update_target_track(target, th, now)
-	local tpos = th.Position
-	local tcf = th.CFrame
-
-	-- Velocity: history track first (CFrame fly), asm as backup.
-	local ivx, ivy, ivz = 0, 0, 0
-	if tr and not tr.spike then
-		ivx, ivy, ivz = tr.vx or 0, tr.vy or 0, tr.vz or 0
-	end
-	local avx, avy, avz = get_part_vel(th)
-	local aspeed = math.sqrt(avx * avx + avy * avy + avz * avz)
-	local tspeed = math.sqrt(ivx * ivx + ivy * ivy + ivz * ivz)
-	if tspeed < 4 and aspeed > tspeed then
-		ivx, ivy, ivz = avx, avy, avz
-		tspeed = aspeed
-	elseif aspeed > 2 and aspeed < 400 and tspeed > 4 then
-		ivx = ivx * 0.85 + avx * 0.15
-		ivy = ivy * 0.85 + avy * 0.15
-		ivz = ivz * 0.85 + avz * 0.15
-		tspeed = math.sqrt(ivx * ivx + ivy * ivy + ivz * ivz)
-	end
-
-	local mx, my, mz = tpos.X, tpos.Y, tpos.Z
-	if me then
-		local mp = me.Position
-		mx, my, mz = mp.X, mp.Y, mp.Z
-	end
-	local dx, dy, dz = tpos.X - mx, tpos.Y - my, tpos.Z - mz
-	local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-
-	local behind = 0
-	local ahead = 0
-	if tspeed > 1 then
-		local inv = 1 / tspeed
-		local along = (dx * ivx + dy * ivy + dz * ivz) * inv
-		-- along > 0 means target is ahead of us in their move dir (we're behind).
-		if along > 0 then
-			behind = along
-		else
-			ahead = -along
+	local cam = Workspace.CurrentCamera
+	if extra then
+		if typeof(extra) == "Instance" then
+			list[#list + 1] = extra
+		elseif type(extra) == "table" then
+			for i = 1, #extra do
+				if extra[i] then
+					list[#list + 1] = extra[i]
+				end
+			end
 		end
 	end
-
-	local catching = dist > 5 or behind > 2.5 or tspeed > 35
-	local locked = dist < 4 and ahead < 3
-	local catch_pow = clamp_n((cfg.sticky_speed or 90) / 30, 0.8, 5)
-	local base_lead = cfg.attach_lead or 0.12
-	local rep_lead = 0
-	if catching and not locked then
-		rep_lead = base_lead * 1.8 * catch_pow + tspeed / 1000 + dist / 260 + behind / 90
-		rep_lead = clamp_n(rep_lead, 0.08, 0.42)
-	elseif tspeed > 8 then
-		-- Locked-on: small lead only — big lead causes overshoot jitter.
-		rep_lead = clamp_n(base_lead * 0.55 * catch_pow + tspeed / 2200, 0.02, 0.14)
+	if cam then
+		list[#list + 1] = cam
 	end
+	return list
+end
 
-	local h = cfg.radius or 3
-	if h < 0.5 then
-		h = 0.5
+local function has_los(from, to, target_model)
+	if not from or not to then
+		return false
 	end
-	local v = cfg.y or 0
-	local mode = cfg.tp_mode or "Sticky"
-	local use_mode = mode
-	if catching and (mode == "Orbit" or mode == "Strafe" or mode == "Random teleport" or mode == "Random") then
-		use_mode = "Sticky"
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+	params.FilterDescendantsInstances = ray_filter({ target_model, Workspace.CurrentCamera })
+	local delta = to - from
+	if delta.Magnitude < 0.05 then
+		return true
 	end
+	local hit = Workspace:Raycast(from, delta, params)
+	if not hit then
+		return true
+	end
+	if (hit.Position - to).Magnitude <= 4 then
+		return true
+	end
+	if target_model and hit.Instance and hit.Instance:IsDescendantOf(target_model) then
+		return true
+	end
+	return false
+end
 
-	-- Predict THEIR position first, then apply offset in their axes (no double-lead).
-	local ax = (tr and not tr.spike and tr.ax) or 0
-	local ay = (tr and not tr.spike and tr.ay) or 0
-	local az = (tr and not tr.spike and tr.az) or 0
-	local half = 0.5 * rep_lead * rep_lead
-	local px = tpos.X + ivx * rep_lead + ax * half
-	local py = tpos.Y + ivy * rep_lead + ay * half
-	local pz = tpos.Z + ivz * rep_lead + az * half
-
+local function mode_attach_cf(th, target, mode, h, v)
+	local tcf = th.CFrame
+	local tpos = th.Position
 	local r, u, l = tcf.RightVector, tcf.UpVector, tcf.LookVector
 	local ox, oy, oz = 0, v, h
-	if use_mode == "Sticky" or use_mode == "Behind" then
-		-- Catch = sit on them; locked = use full offset.
-		oz = catching and math.min(h, 1.1) or h
-		oy = catching and v * 0.35 or v
-	elseif use_mode == "In Front" then
-		oz = -(catching and math.min(h, 1.1) or h)
-	elseif use_mode == "Above" then
-		ox, oy, oz = 0, (catching and math.min(h, 2) or h) + v, 0
-	elseif use_mode == "Orbit" or use_mode == "Strafe" then
+	local now = tick()
+
+	if mode == "In Front" then
+		oz = -h
+	elseif mode == "Above" then
+		ox, oy, oz = 0, h + v, 0
+	elseif mode == "Orbit" or mode == "Strafe" then
 		if orbit_last_t <= 0 then
 			orbit_last_t = now
 		end
@@ -1249,11 +1280,11 @@ local function snap_attach(target)
 			dt = 0.05
 		end
 		orbit_last_t = now
-		orbit_angle = orbit_angle + (cfg.strafe_speed or 50) * 0.35 * dt
+		orbit_angle = (orbit_angle or 0) + (cfg.strafe_speed or 50) * 0.35 * dt
 		ox = math.cos(orbit_angle) * h
 		oy = v
 		oz = math.sin(orbit_angle) * h
-	elseif use_mode == "Random teleport" or use_mode == "Random" then
+	elseif mode == "Random teleport" or mode == "Random" then
 		if (not last_random_off) or (now - last_random_t) >= 0.08 then
 			last_random_off = {
 				x = (math.random() * 2 - 1) * h,
@@ -1263,25 +1294,134 @@ local function snap_attach(target)
 			last_random_t = now
 		end
 		ox, oy, oz = last_random_off.x, v + last_random_off.y, last_random_off.z
+	else
+		oz = h
+		oy = v
 	end
 
-	-- Object offset: +X right, +Y up, +Z behind ( -LookVector ).
-	local wx = px + r.X * ox + u.X * oy - l.X * oz
-	local wy = py + r.Y * ox + u.Y * oy - l.Y * oz
-	local wz = pz + r.Z * ox + u.Z * oy - l.Z * oz
-
-	local cf = cf_xyz(wx, wy, wz)
+	local wx = tpos.X + r.X * ox + u.X * oy - l.X * oz
+	local wy = tpos.Y + r.Y * ox + u.Y * oy - l.Y * oz
+	local wz = tpos.Z + r.Z * ox + u.Z * oy - l.Z * oz
+	local pos = Vector3.new(wx, wy, wz)
 	if cfg.face then
-		cf = cf_look(Vector3.new(wx, wy, wz), Vector3.new(px, py, pz))
+		return cf_look(pos, tpos)
+	end
+	return cf_xyz(wx, wy, wz)
+end
+
+local function pick_open_cf(th, target, mode, h, v)
+	local tpos = th.Position
+	local model = hc_model(target) or (target and target.Character)
+	local aim = tpos + Vector3.new(0, 1.4, 0)
+	local function try_pos(pos)
+		local eye = pos + Vector3.new(0, 1.35, 0)
+		if not has_los(eye, aim, model) then
+			return nil
+		end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.IgnoreWater = true
+		params.FilterDescendantsInstances = ray_filter({ model })
+		local to_cand = pos - tpos
+		local td = to_cand.Magnitude
+		if td > 0.5 then
+			local block = Workspace:Raycast(aim, to_cand.Unit * math.min(td, h + 2), params)
+			if block and (block.Position - pos).Magnitude > 3 then
+				return nil
+			end
+		end
+		local cf = CFrame.new(pos)
+		if cfg.face then
+			cf = cf_look(pos, tpos)
+		end
+		return cf
 	end
 
-	local mul = 1.05
-	if catching and not locked then
-		mul = 1.2 + math.min(0.75, catch_pow * 0.12)
+	if mode ~= "Random teleport" and mode ~= "Random" then
+		local cf = mode_attach_cf(th, target, mode, h, v)
+		local eye = cf.Position + Vector3.new(0, 1.35, 0)
+		if has_los(eye, aim, model) then
+			return cf
+		end
 	end
-	local carry = Vector3.new(ivx * mul, ivy * mul, ivz * mul)
-	apply_cf(cf, carry)
-	apply_cf(cf, carry)
+
+	if mode == "Random teleport" or mode == "Random" then
+		local radii = { math.max(2, h * 0.35), math.max(3, h * 0.6), h, h }
+		for ri = 1, #radii do
+			local rad = radii[ri]
+			for _ = 1, 8 do
+				local ang = math.random() * math.pi * 2
+				local oy = 1.5 + math.random() * math.max(0.5, math.abs(v))
+				local pos = tpos + Vector3.new(math.cos(ang) * rad, oy, math.sin(ang) * rad)
+				local cf = try_pos(pos)
+				if cf then
+					return cf
+				end
+			end
+		end
+		local fallback = tpos + Vector3.new(0, math.max(2.5, math.abs(v)), 3)
+		return try_pos(fallback) or cf_look(fallback, tpos)
+	end
+
+	local now = tick()
+	if orbit_last_t <= 0 then
+		orbit_last_t = now
+	end
+	local dt = now - orbit_last_t
+	if dt < 0 then
+		dt = 0
+	elseif dt > 0.05 then
+		dt = 0.05
+	end
+	orbit_last_t = now
+	local speed = cfg.strafe_speed or 50
+	orbit_angle = (orbit_angle or 0) + clamp_n(speed * 15 * dt, 0, 360)
+	if orbit_angle > 360 then
+		orbit_angle = orbit_angle - 360
+	end
+	for step = 0, 11 do
+		local ang = orbit_angle + step * 30
+		local base = tpos + Vector3.new(0, v, 0)
+		local ring = CFrame.Angles(0, math.rad(ang), 0) * CFrame.new(0, 0, h)
+		local rp = ring.Position
+		local pos = Vector3.new(base.X + rp.X, base.Y + rp.Y, base.Z + rp.Z)
+		local cf = try_pos(pos)
+		if cf then
+			orbit_angle = ang % 360
+			return cf
+		end
+	end
+	local fallback = tpos + Vector3.new(0, math.max(2.5, math.abs(v)), 0)
+	return try_pos(fallback) or cf_look(fallback, tpos)
+end
+
+local function snap_attach(target)
+	if not target or not cfg.tp or dead(target) or knocked(target) then
+		return false
+	end
+	local th = get_stick_part(target) or hrp(target)
+	if not th then
+		return false
+	end
+	local me = nil
+	if LP.Character then
+		local hum = LP.Character:FindFirstChildOfClass("Humanoid")
+		me = (hum and hum.RootPart) or LP.Character:FindFirstChild("HumanoidRootPart")
+	end
+	me = me or hrp(LP)
+	remember_return_cf(me)
+	update_target_track(target, th, tick())
+	local h = cfg.radius or 3
+	if h < 0.5 then
+		h = 0.5
+	end
+	local v = cfg.y or 0
+	local mode = cfg.tp_mode or "Sticky"
+	local cf = pick_open_cf(th, target, mode, h, v)
+	if not cf then
+		return false
+	end
+	apply_cf(cf)
 	lplr_pos = cf
 	active_attach_target = target
 	return true
@@ -1300,14 +1440,57 @@ local function shoot_origin()
 	return me and me.Position, me
 end
 
+local function equipped_gun()
+	local char = LP.Character
+	if not char then
+		return nil
+	end
+	local tool = char:FindFirstChildOfClass("Tool")
+	if tool and tool:FindFirstChild("Handle") then
+		return tool
+	end
+end
+
+local function gun_muzzle_origin(tool, handle)
+	if not tool or not handle then
+		return nil
+	end
+	local def = tool:FindFirstChild("Default")
+	local mesh = def and def:FindFirstChild("Mesh")
+	local muzzle = mesh and mesh:FindFirstChild("Muzzle")
+	if muzzle then
+		local ok, wp = pcall(function()
+			return muzzle.WorldPosition
+		end)
+		if ok and wp then
+			return wp
+		end
+	end
+	local att = handle:FindFirstChild("Muzzle")
+	if att then
+		local ok, wp = pcall(function()
+			return att.WorldPosition
+		end)
+		if ok and wp then
+			return wp
+		end
+	end
+	return handle.Position
+end
+
 local function get_gun_origin()
 	local char = LP.Character
 	if char then
 		local tool = char:FindFirstChildOfClass("Tool")
 		if tool then
+			local handle = tool:FindFirstChild("Handle")
+			local from_muzzle = gun_muzzle_origin(tool, handle)
+			if from_muzzle and handle and from_muzzle ~= handle.Position then
+				return from_muzzle
+			end
 			local muzzle = nil
 			for _, d in tool:GetDescendants() do
-				if d:IsA("Attachment") then
+				if d.ClassName == "Attachment" then
 					local n = string.lower(d.Name)
 					if string.find(n, "muzzle", 1, true)
 						or string.find(n, "tip", 1, true)
@@ -1328,7 +1511,6 @@ local function get_gun_origin()
 					return wp
 				end
 			end
-			local handle = tool:FindFirstChild("Handle")
 			if handle then
 				local lv = handle.CFrame.LookVector
 				return Vector3.new(handle.Position.X + lv.X * 1.8, handle.Position.Y + lv.Y * 1.8, handle.Position.Z + lv.Z * 1.8)
@@ -1341,6 +1523,45 @@ local function get_gun_origin()
 		return Vector3.new(me.Position.X + lv.X * 2.2, me.Position.Y + 1.35 + lv.Y * 2.2, me.Position.Z + lv.Z * 2.2)
 	end
 	return nil
+end
+
+local function ensure_ammo(tool)
+	if is_hood_customs() then
+		return true
+	end
+	tool = tool or equipped_gun()
+	if not tool then
+		return false
+	end
+	local ammo = tool:FindFirstChild("Ammo")
+	local max = tool:FindFirstChild("MaxAmmo")
+	if not ammo then
+		return true
+	end
+	if ammo.Value > 0 then
+		return true
+	end
+	event = event or get_main_event()
+	if not event then
+		remote_status = "no shoot remote"
+		return false
+	end
+	local now = tick()
+	if (now - last_reload) < 0.4 then
+		remote_status = "reloading..."
+		return false
+	end
+	last_reload = now
+	local ok = pcall(function()
+		event:FireServer("Reload", true)
+	end)
+	if not ok then
+		pcall(function()
+			event:FireServer("Reload", tool)
+		end)
+	end
+	remote_status = "reload 0/" .. tostring(max and max.Value or "?")
+	return false
 end
 
 local function drawing_remove(obj)
@@ -1480,35 +1701,46 @@ local function update_hit_tracers()
 end
 
 local function fire_mouse_pos(pos)
-	event = event or get_main_event()
-	if not event or not pos then
+	if not pos then
 		return
 	end
 	last_mouse_pos = pos
+	local be = LP.Character and LP.Character:FindFirstChild("BodyEffects")
+	local mp = be and be:FindFirstChild("MousePos")
+	if mp then
+		pcall(function()
+			mp.Value = pos
+		end)
+	end
+	event = event or get_main_event()
+	if not event then
+		return
+	end
+
+	if is_des_hood() and event.Name == "MainGameEvent" then
+		return
+	end
 	pcall(function()
-		event:FireServer("MousePosUpdate", pos)
+		event:FireServer(MOUSE_ARG, pos)
 	end)
+	if is_der_hood() and MOUSE_ARG ~= "UpdateMousePos" then
+		pcall(function()
+			event:FireServer("UpdateMousePos", pos)
+		end)
+	end
 end
 
--- Exact dump shape from your spy:
--- MainEvent:FireServer("Shoot", {
---   { { Position, Normal, Instance = SpecialParts.HRP } },
---   { { thePart = SpecialParts.HRP, theOffset = Vector3(-0.57, 0.01, -0.30) } },
---   origin, endPos, serverTime
--- })
 local function build_shoot_payload(part)
 	if not part then
 		return nil
 	end
 
-	-- Match dump offset (small in-part hit, not center / not multi-part).
 	local offset = Vector3.new(-0.57, 0.01, -0.30)
 	local hit_pos = part.Position
 	pcall(function()
 		hit_pos = part.CFrame:PointToWorldSpace(offset)
 	end)
 
-	-- Origin MUST stay near local character (server check). Far fake muzzle breaks sticky.
 	local origin = get_gun_origin()
 	local me = nil
 	if LP.Character then
@@ -1528,7 +1760,6 @@ local function build_shoot_payload(part)
 	local dy = hit_pos.Y - origin.Y
 	local dz = hit_pos.Z - origin.Z
 	local mag = math.sqrt(dx * dx + dy * dy + dz * dz)
-	-- Only nudge muzzle a few studs if overlapping the hit (keep near character).
 	if mag < 1.25 and me then
 		local lv = me.CFrame.LookVector
 		origin = Vector3.new(hit_pos.X - lv.X * 3.5, hit_pos.Y + 1.2, hit_pos.Z - lv.Z * 3.5)
@@ -1563,10 +1794,142 @@ local function build_shoot_payload(part)
 	return payload, hit_pos, origin
 end
 
+local function hit_pos_of(part)
+	local hit_pos = part.Position
+	pcall(function()
+		hit_pos = part.CFrame:PointToWorldSpace(Vector3.new(-0.57, 0.01, -0.30))
+	end)
+	return hit_pos
+end
+
+local function fire_shoot_des(part, times)
+	local tool = equipped_gun()
+	local handle = tool and tool:FindFirstChild("Handle")
+	if not handle then
+		remote_status = "no gun Handle"
+		return false
+	end
+	if not ensure_ammo(tool) then
+		return false
+	end
+	local range = (tool:FindFirstChild("Range") and tool.Range.Value) or 200
+	local damage = (tool:FindFirstChild("Damage") and tool.Damage.Value) or 0
+	local is_shotgun = tool:FindFirstChild("GunClientShotgun") ~= nil
+	local ok_any, err, fired, form = false, nil, 0, "?"
+	local last_hit, last_origin
+	for _ = 1, times do
+		if not ensure_ammo(tool) then
+			break
+		end
+		local hit_pos = hit_pos_of(part)
+		local origin = gun_muzzle_origin(tool, handle) or get_gun_origin() or handle.Position
+		local dir = hit_pos - origin
+		local mag = dir.Magnitude
+		local normal = mag > 0.001 and (-dir.Unit) or Vector3.new(0, 1, 0)
+		fire_mouse_pos(hit_pos)
+		last_hit, last_origin = hit_pos, origin
+		local ok, e
+		if is_shotgun then
+			local pellets = {}
+			for i = 1, 5 do
+				pellets[i] = {
+					AimPosition = hit_pos,
+					Result1 = hit_pos,
+					Result2 = part,
+					Result3 = normal,
+				}
+			end
+			ok, e = pcall(function()
+				event:FireServer("ShootGun", handle, origin, pellets, nil, nil, nil, range, damage)
+			end)
+			form = "ShootGun/shotgun"
+		else
+			ok, e = pcall(function()
+				event:FireServer("ShootGun", handle, origin, nil, hit_pos, part, normal, range, damage)
+			end)
+			form = "ShootGun"
+		end
+		if ok then
+			ok_any, fired = true, fired + 1
+		else
+			err = e
+		end
+	end
+	local ammo = tool:FindFirstChild("Ammo")
+	if ammo and ammo.Value <= 0 then
+		ensure_ammo(tool)
+	end
+	if ok_any then
+		shoot_fail_streak = 0
+		remote_status = form .. " x" .. tostring(fired) .. " → " .. part.Name
+		if last_origin and last_hit then
+			add_hit_tracer(last_origin, last_hit)
+		end
+		return true, last_hit
+	end
+	if string.find(tostring(remote_status), "reload", 1, true) then
+		return false
+	end
+	shoot_fail_streak = shoot_fail_streak + 1
+	event = nil
+	remote_status = "ShootGun FAIL " .. tostring(err)
+	return false, last_hit
+end
+
+local function fire_shoot_der(part, times)
+	local tool = equipped_gun()
+	if not tool then
+		remote_status = "no gun"
+		return false
+	end
+	if not ensure_ammo(tool) then
+		return false
+	end
+	local handle = tool:FindFirstChild("Handle")
+	local origin = gun_muzzle_origin(tool, handle) or get_gun_origin()
+	local hit_pos = hit_pos_of(part)
+	local ok_any, fired, form = false, 0, "?"
+	for _ = 1, times do
+		if not ensure_ammo(tool) then
+			break
+		end
+		fire_mouse_pos(hit_pos)
+		local ok_act = pcall(function()
+			tool:Activate()
+		end)
+		local ok_click = false
+		pcall(function()
+			if typeof(mouse1click) == "function" then
+				mouse1click()
+				ok_click = true
+			end
+		end)
+		local ok_shoot = pcall(function()
+			event:FireServer("Shoot")
+		end)
+		if ok_act or ok_click or ok_shoot then
+			ok_any = true
+			fired = fired + 1
+			form = (ok_act and "Activate") or (ok_click and "click") or "Shoot"
+		end
+	end
+	if ok_any then
+		shoot_fail_streak = 0
+		remote_status = form .. "/" .. MOUSE_ARG .. " x" .. tostring(fired) .. " → " .. part.Name
+		if origin and hit_pos then
+			add_hit_tracer(origin, hit_pos)
+		end
+		return true, hit_pos
+	end
+	shoot_fail_streak = shoot_fail_streak + 1
+	remote_status = "Der Hood shoot FAIL — hold a gun"
+	return false, hit_pos
+end
+
 local function fire_shoot(part, times)
 	event = event or get_main_event()
 	if not event or not part then
-		remote_status = event and "no part" or "no MainEvent"
+		remote_status = event and "no part" or "no shoot remote"
 		return false
 	end
 
@@ -1584,6 +1947,13 @@ local function fire_shoot(part, times)
 		times = 1
 	end
 
+	if is_der_hood() then
+		return fire_shoot_der(part, times)
+	end
+	if is_des_hood() or event.Name == "MainGameEvent" then
+		return fire_shoot_des(part, times)
+	end
+
 	local ok_any = false
 	local err
 	local fired = 0
@@ -1599,7 +1969,6 @@ local function fire_shoot(part, times)
 		last_hit, last_origin = hit_pos, origin
 		fire_mouse_pos(hit_pos)
 
-		-- Fire BOTH forms every shot (Matcha / spy packing differs).
 		local ok1, e1 = pcall(function()
 			event:FireServer("Shoot", payload)
 		end)
@@ -1644,15 +2013,18 @@ local function rage_shoot_target(target)
 		return false
 	end
 
-	-- Damage part = SpecialParts only (your dump).
+	local m = hc_model(target)
 	local s = special(target)
-	if not s or s.Name ~= "SpecialParts" then
-		-- special() can fall back to whole model — require real SpecialParts folder.
-		local m = hc_model(target)
-		s = m and m:FindFirstChild("SpecialParts")
-	end
-	if not s then
-		remote_status = "no SpecialParts"
+	if is_hood_customs() then
+		if not s or s.Name ~= "SpecialParts" then
+			s = m and m:FindFirstChild("SpecialParts")
+		end
+		if not s then
+			remote_status = "no SpecialParts"
+			return false
+		end
+	elseif not s then
+		remote_status = "no character"
 		return false
 	end
 
@@ -1661,30 +2033,33 @@ local function rage_shoot_target(target)
 		or find_part(s, "HumanoidRootPart")
 		or find_part(s, "Head")
 		or find_part(s, "UpperTorso")
+		or find_part(m, hitbox)
+		or find_part(m, "HumanoidRootPart")
+		or find_part(m, "Head")
 	if not aim then
-		remote_status = "no SpecialParts hitbox"
+		remote_status = "no hitbox"
 		return false
 	end
 
-	-- Confirm path looks like dump: ...Characters.<name>.SpecialParts.<part>
-	local path_ok = false
-	pcall(function()
-		path_ok = aim:IsDescendantOf(chars_folder())
-	end)
+	local origin = get_gun_origin()
+	local model = m or target.Character
+	if origin and aim and not has_los(origin, aim.Position, model) then
+		remote_status = "blocked LOS — reattach"
+		snap_attach(target)
+		return false
+	end
 
 	local burst = cfg.burst or 6
 	if burst < 1 then
 		burst = 1
 	end
-	last_shoot = now
-	local ok = fire_shoot(aim, burst)
-	if ok and not path_ok then
-		remote_status = tostring(remote_status) .. " (warn: not under Characters)"
+	if is_der_hood() and burst > 3 then
+		burst = 3
 	end
-	return ok
+	last_shoot = now
+	return fire_shoot(aim, burst)
 end
 
--- Lean stick loop — no shoot/UI work, max frequency.
 local function on_stick_step()
 	if not running or not rage_active() or not cfg.tp then
 		return
@@ -1736,7 +2111,7 @@ if not Lib then
 end
 
 win = Lib:CreateWindow({
-	title = "Hood Customs",
+	title = GAME_TITLE,
 	subtitle = "Ragebot",
 	size = Vector2.new(720, 800),
 	menuKey = "p",
@@ -1805,7 +2180,7 @@ rage:Button("Refresh Targets", function()
 	end)
 	prune_selected()
 	status = "list refreshed"
-	Lib:Notify("Hood Customs", "player list refreshed", 2, "success")
+	Lib:Notify(GAME_TITLE, "player list refreshed", 2, "success")
 end)
 
 rage:Label(function()
@@ -1819,6 +2194,9 @@ rage:Label(function()
 end)
 rage:Label(function()
 	return "Remote: " .. tostring(remote_status)
+end)
+rage:Label(function()
+	return "Game: " .. GAME_TITLE .. " (" .. GAME_KIND .. ")"
 end)
 rage:Label(function()
 	return "Chars: " .. (chars_folder() and "OK" or "MISSING")
@@ -1855,7 +2233,7 @@ end)
 tp:Slider("Catch Power", 90, 5, 10, 150, "", function(v)
 	cfg.sticky_speed = v
 end)
-tp:Info("Sticks to visible Character (not laggy SpecialParts). Catch Power high = faster catch; lowers lead when locked.")
+tp:Info("Exact hood copies teleport: Character HRP + mode offset, then first open LOS spot. No prediction lead.")
 
 local shoot = tab:Section("Shoot", "Right", "MainEvent Shoot")
 shoot:Toggle("Fire Shoot Remote", true, function(on)
@@ -1867,7 +2245,11 @@ end)
 shoot:Dropdown("Hitbox", { "HumanoidRootPart" }, HITBOXES, false, function(v)
 	cfg.hitbox = (v and v[1]) or "HumanoidRootPart"
 end)
-shoot:Info("Exact dump: SpecialParts part + offset (-0.57,0.01,-0.30), origin near YOU (not 55-stud fake).")
+shoot:Info(
+	is_der_hood() and "Der Hood: MainEvent skid mouse + Activate/click. Hold a gun."
+		or is_des_hood() and "Des Hood: MainGameEvent ShootGun (Handle, origin, hit)."
+		or "Hood Customs: SpecialParts part + offset, origin near YOU."
+)
 shoot:Slider("Burst", 6, 1, 1, 16, "", function(v)
 	cfg.burst = v
 end)
@@ -2005,7 +2387,6 @@ local function on_heartbeat(dt)
 
 	local me = hrp(LP)
 
-	-- Stick FIRST so later heartbeat work can't leave you a frame behind.
 	if rage_active() and cfg.tp then
 		local early = active_attach_target
 		if not early or dead(early) then
@@ -2286,6 +2667,6 @@ _G.hc_ragebot_unload = function()
 end
 
 pcall(function()
-	Lib:Notify("Hood Customs", "Press P for menu — multi-select Targets", 4, "success")
+	Lib:Notify(GAME_TITLE, "Press P for menu — multi-select Targets", 4, "success")
 end)
-print("[HC] INS ui + Heartbeat ragebot ready")
+print("[HC] INS ui + Heartbeat ragebot ready", GAME_KIND)
