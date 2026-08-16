@@ -8,10 +8,18 @@ local cfg = {
 	bat_hit_range = 50,
 	attack_rate = 15,
 	hits_per_attack = 2,
+	void_bloaters = true,
 }
 
+local VOID_CF = CFrame.new(0, -500, 0)
+local VOID_INTERVAL = 0.25
+local SCAN_INTERVAL = 0.1
+
+local bloater_scan_accum = 0
+local void_stamp = {}
+
 local cached_tool, cached_swing, cached_hit
-local cached_char_addr
+local cached_tool_addr
 local accum = 0
 local status = "idle"
 
@@ -28,6 +36,21 @@ local function addr(inst)
 	return nil
 end
 
+local function get_character()
+	local characters = Workspace:FindFirstChild("Characters")
+	if characters then
+		local by_name = characters:FindFirstChild(LocalPlayer.Name)
+		if by_name then
+			return by_name, characters
+		end
+	end
+	local char = LocalPlayer.Character
+	if char and char.Parent then
+		return char, characters
+	end
+	return nil, characters
+end
+
 local function get_root(model)
 	if not model then
 		return nil
@@ -37,6 +60,13 @@ local function get_root(model)
 		or model:FindFirstChild("Torso")
 		or model:FindFirstChild("UpperTorso")
 		or model:FindFirstChildWhichIsA("BasePart")
+end
+
+local function get_head(model)
+	if not model then
+		return nil
+	end
+	return model:FindFirstChild("Head") or get_root(model)
 end
 
 local function dist2(a, b)
@@ -60,6 +90,90 @@ local function is_alive(model)
 	return health > 0
 end
 
+local function contains_bloater(text)
+	if not text then
+		return false
+	end
+	local ok, lower = pcall(string.lower, tostring(text))
+	if not ok then
+		return tostring(text) == "Bloater"
+	end
+	return string.find(lower, "bloater", 1, true) ~= nil
+end
+
+local function is_bloater(model)
+	if not model then
+		return false
+	end
+	if contains_bloater(model.Name) then
+		return true
+	end
+	local ok, variant = pcall(function()
+		return model:GetAttribute("Variant")
+	end)
+	return ok and contains_bloater(variant)
+end
+
+local function bloater_health(model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return nil
+	end
+	local ok, health = pcall(function()
+		return humanoid.Health
+	end)
+	if not ok then
+		return nil
+	end
+	return health
+end
+
+local function bloater_fusing()
+	local kids = Workspace:GetChildren()
+	for i = 1, #kids do
+		if kids[i].Name == "BloaterIndicator" then
+			return true
+		end
+	end
+	return false
+end
+
+local function void_hrp(model)
+	local id = addr(model)
+	local now = tick()
+	if id and void_stamp[id] and (now - void_stamp[id]) < VOID_INTERVAL then
+		return
+	end
+	local root = get_root(model)
+	if not root then
+		return
+	end
+	pcall(function()
+		root.CFrame = VOID_CF
+	end)
+	if id then
+		void_stamp[id] = now
+	end
+end
+
+local function handle_bloaters(characters)
+	local fusing = bloater_fusing()
+	if not characters then
+		return
+	end
+	local children = characters:GetChildren()
+	for i = 1, #children do
+		local child = children[i]
+		if is_bloater(child) then
+			local hp = bloater_health(child)
+			local dead = hp ~= nil and hp <= 0
+			if fusing or dead then
+				void_hrp(child)
+			end
+		end
+	end
+end
+
 local function player_name_set()
 	local names = {}
 	local list = Players:GetPlayers()
@@ -69,53 +183,66 @@ local function player_name_set()
 	return names
 end
 
+local function tool_is_held(tool, character)
+	if not (tool and character) then
+		return false
+	end
+	local ok, parent = pcall(function()
+		return tool.Parent
+	end)
+	if not ok or not parent then
+		return false
+	end
+	return addr(parent) == addr(character)
+end
+
+local function remotes_from_tool(tool)
+	if not tool then
+		return nil
+	end
+	local hit_targets = tool:FindFirstChild("HitTargets")
+	if not hit_targets then
+		return nil
+	end
+	return tool, tool:FindFirstChild("Swing"), hit_targets
+end
+
 local function find_combat_tool(character)
-	local char_addr = addr(character)
-	if cached_char_addr == char_addr and cached_swing and cached_hit then
+	local equipped = character:FindFirstChildOfClass("Tool")
+	local equipped_addr = addr(equipped)
+
+	if equipped_addr and cached_tool_addr == equipped_addr and cached_hit and tool_is_held(cached_tool, character) then
 		local ok = pcall(function()
-			return cached_swing.Parent and cached_hit.Parent
+			return cached_hit.Parent
 		end)
-		if ok and cached_swing.Parent and cached_hit.Parent then
+		if ok and cached_hit.Parent then
 			return cached_tool, cached_swing, cached_hit
 		end
 	end
 
-	local bat = character:FindFirstChild("Bat")
-	if bat then
-		local swing = bat:FindFirstChild("Swing")
-		local hit_targets = bat:FindFirstChild("HitTargets")
-		if hit_targets then
-			cached_char_addr, cached_tool, cached_swing, cached_hit = char_addr, bat, swing, hit_targets
-			return bat, swing, hit_targets
-		end
-	end
-
-	local tool = character:FindFirstChildOfClass("Tool")
-	if tool then
-		local swing = tool:FindFirstChild("Swing")
-		local hit_targets = tool:FindFirstChild("HitTargets")
-		if hit_targets then
-			cached_char_addr, cached_tool, cached_swing, cached_hit = char_addr, tool, swing, hit_targets
-			return tool, swing, hit_targets
-		end
+	local tool, swing, hit_targets = remotes_from_tool(equipped)
+	if hit_targets then
+		cached_tool_addr, cached_tool, cached_swing, cached_hit = equipped_addr, tool, swing, hit_targets
+		return tool, swing, hit_targets
 	end
 
 	local children = character:GetChildren()
 	for i = 1, #children do
 		local child = children[i]
-		local hit_targets = child:FindFirstChild("HitTargets")
-		if hit_targets then
-			local swing = child:FindFirstChild("Swing")
-			cached_char_addr, cached_tool, cached_swing, cached_hit = char_addr, child, swing, hit_targets
-			return child, swing, hit_targets
+		if child.ClassName == "Tool" then
+			tool, swing, hit_targets = remotes_from_tool(child)
+			if hit_targets then
+				cached_tool_addr, cached_tool, cached_swing, cached_hit = addr(child), tool, swing, hit_targets
+				return tool, swing, hit_targets
+			end
 		end
 	end
 
-	cached_char_addr, cached_tool, cached_swing, cached_hit = char_addr, nil, nil, nil
+	cached_tool_addr, cached_tool, cached_swing, cached_hit = nil, nil, nil, nil
 	return nil
 end
 
-local function get_closest_zombie(characters, my_character, max_range, player_names)
+local function get_closest_zombie(characters, my_character, max_range)
 	local my_root = get_root(my_character)
 	if not my_root then
 		status = "no my root"
@@ -125,19 +252,21 @@ local function get_closest_zombie(characters, my_character, max_range, player_na
 	local my_pos = my_root.Position
 	local my_addr = addr(my_character)
 	local my_name = LocalPlayer.Name
-	local best, best_d2 = nil, max_range * max_range
+	local player_names = player_name_set()
+	local best, best_head, best_d2 = nil, nil, max_range * max_range
 	local children = characters:GetChildren()
 
 	for i = 1, #children do
 		local child = children[i]
 		local name = child.Name
 		if name ~= my_name and not player_names[name] and addr(child) ~= my_addr and is_alive(child) then
-			local root = get_root(child)
-			if root then
-				local d2 = dist2(my_pos, root.Position)
+			local head = get_head(child)
+			if head then
+				local d2 = dist2(my_pos, head.Position)
 				if d2 <= best_d2 then
 					best_d2 = d2
 					best = child
+					best_head = head
 				end
 			end
 		end
@@ -148,7 +277,7 @@ local function get_closest_zombie(characters, my_character, max_range, player_na
 	else
 		status = "no zombie in range"
 	end
-	return best
+	return best, best_head, my_root
 end
 
 local Lib
@@ -181,7 +310,7 @@ end)
 
 Lib:Category("COMBAT")
 local tab = win:Tab("Melee", "swords")
-local sec = tab:Section("Combat", "Left", "fires HitTargets with one closest zombie")
+local sec = tab:Section("Combat", "Left", "held Tool → Swing + HitTargets")
 
 local melee_toggle = sec:Toggle("Enabled", false, function(on)
 	cfg.bat_hit_on = on == true
@@ -204,10 +333,14 @@ sec:Slider("Hits / Attack", 2, 1, 1, 6, "x", function(v)
 	cfg.hits_per_attack = math.max(1, math.floor(tonumber(v) or 2))
 end)
 
+sec:Toggle("Void Bloaters", true, function(on)
+	cfg.void_bloaters = on == true
+end)
+
 sec:Label(function()
 	return "Status: " .. tostring(status)
 end)
-sec:Info("Press P to open/close. Keybind: B")
+sec:Info("Hold any melee tool. Press P / B")
 
 local hb = RunService.Heartbeat
 if not hb then
@@ -216,6 +349,15 @@ end
 
 local ok_conn, err_conn = pcall(function()
 	hb:Connect(function(dt)
+		if cfg.void_bloaters then
+			bloater_scan_accum += dt
+			if bloater_scan_accum >= SCAN_INTERVAL then
+				bloater_scan_accum = 0
+				local character, characters = get_character()
+				handle_bloaters(characters)
+			end
+		end
+
 		if not cfg.bat_hit_on then
 			accum = 0
 			return
@@ -231,13 +373,11 @@ local ok_conn, err_conn = pcall(function()
 			accum = 0
 		end
 
-		local characters = Workspace:FindFirstChild("Characters")
+		local character, characters = get_character()
 		if not characters then
 			status = "no Characters folder"
 			return
 		end
-
-		local character = characters:FindFirstChild(LocalPlayer.Name) or LocalPlayer.Character
 		if not character then
 			status = "no character"
 			return
@@ -249,38 +389,45 @@ local ok_conn, err_conn = pcall(function()
 
 		local tool, swing, hit_targets = find_combat_tool(character)
 		if not hit_targets then
-			status = "no HitTargets (equip Bat)"
+			status = "hold a melee tool"
 			return
 		end
 
-		local range = cfg.bat_hit_range or 50
-		local zombie = get_closest_zombie(characters, character, range, player_name_set())
+		local zombie = get_closest_zombie(characters, character, cfg.bat_hit_range or 50)
 		if not zombie then
 			return
 		end
 
 		local payload = { zombie }
-
-		if swing then
-			pcall(function()
-				swing:FireServer()
-			end)
-		end
-
 		local fired = 0
+		local last_err
 		for _ = 1, cfg.hits_per_attack do
-			local ok = pcall(function()
+			if swing then
+				pcall(function()
+					swing:FireServer()
+				end)
+			end
+			local ok, err = pcall(function()
 				hit_targets:FireServer(payload)
 			end)
 			if ok then
 				fired += 1
+			else
+				last_err = err
 			end
 		end
 
 		if fired == 0 then
-			status = "FireServer failed"
+			status = "FireServer fail: " .. tostring(last_err)
 		else
-			status = string.format("hit %s x%d", zombie.Name, fired)
+			status = string.format("%s → %s x%d", tostring(tool and tool.Name or "melee"), zombie.Name, fired)
+		end
+
+		if cfg.void_bloaters and is_bloater(zombie) then
+			local hp = bloater_health(zombie)
+			if hp ~= nil and hp <= 0 then
+				void_hrp(zombie)
+			end
 		end
 	end)
 end)
