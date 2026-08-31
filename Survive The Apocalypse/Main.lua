@@ -3,6 +3,21 @@ local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 
+local INS_UI_URL = "https://raw.githubusercontent.com/lec1e/Matcha-UI-Libraries/refs/heads/main/INS%20UI.lua"
+
+local function http_get(url)
+	local ok, body = pcall(function()
+		return game:HttpGet(url)
+	end)
+	if ok and type(body) == "string" and #body > 0 then
+		return body
+	end
+	if httpget then
+		return httpget(url)
+	end
+	error("HttpGet failed for " .. tostring(url))
+end
+
 local cfg = {
 	bat_hit_on = false,
 	bat_hit_range = 50,
@@ -11,12 +26,13 @@ local cfg = {
 	void_bloaters = true,
 }
 
-local VOID_CF = CFrame.new(0, -500, 0)
-local VOID_INTERVAL = 0.25
-local SCAN_INTERVAL = 0.1
+local VOID_CF = CFrame.new(0, -10000, 0)
+local VOID_HOLD = 0.1
+local VOID_PARTS = { "HumanoidRootPart", "Torso", "UpperTorso", "LowerTorso", "Head" }
 
-local bloater_scan_accum = 0
-local void_stamp = {}
+local last_void = {}
+local last_hp = {}
+local bloater_list = {}
 
 local cached_tool, cached_swing, cached_hit
 local cached_tool_addr
@@ -114,18 +130,28 @@ local function is_bloater(model)
 	return ok and contains_bloater(variant)
 end
 
-local function bloater_health(model)
-	local humanoid = model:FindFirstChildOfClass("Humanoid")
+local function get_humanoid(model)
+	if not model then
+		return nil
+	end
+	return model:FindFirstChild("Humanoid") or model:FindFirstChildOfClass("Humanoid")
+end
+
+local function read_health(humanoid)
 	if not humanoid then
 		return nil
 	end
 	local ok, health = pcall(function()
 		return humanoid.Health
 	end)
-	if not ok then
-		return nil
+	if ok then
+		return health
 	end
-	return health
+	return nil
+end
+
+local function bloater_health(model)
+	return read_health(get_humanoid(model))
 end
 
 local function bloater_fusing()
@@ -138,37 +164,67 @@ local function bloater_fusing()
 	return false
 end
 
-local function void_hrp(model)
+local function void_model(model)
+	if not model then
+		return
+	end
 	local id = addr(model)
 	local now = tick()
-	if id and void_stamp[id] and (now - void_stamp[id]) < VOID_INTERVAL then
+	if id and last_void[id] and (now - last_void[id]) < VOID_HOLD then
 		return
 	end
-	local root = get_root(model)
-	if not root then
-		return
+	for i = 1, #VOID_PARTS do
+		local part = model:FindFirstChild(VOID_PARTS[i])
+		if part then
+			pcall(function()
+				part.CFrame = VOID_CF
+			end)
+		end
 	end
-	pcall(function()
-		root.CFrame = VOID_CF
-	end)
+	local root = model.PrimaryPart
+	if root then
+		pcall(function()
+			root.CFrame = VOID_CF
+		end)
+	end
 	if id then
-		void_stamp[id] = now
+		last_void[id] = now
 	end
 end
 
+local function bloater_should_void(model)
+	local id = addr(model)
+	local humanoid = get_humanoid(model)
+	local hp = read_health(humanoid)
+	if hp ~= nil then
+		if id then
+			last_hp[id] = hp
+		end
+		if hp <= 0 then
+			return true
+		end
+		return false
+	end
+	-- Humanoid gone after we had live HP = they just died
+	if id and last_hp[id] ~= nil and last_hp[id] > 0 then
+		return true
+	end
+	return false
+end
+
 local function handle_bloaters(characters)
-	local fusing = bloater_fusing()
 	if not characters then
 		return
 	end
+	local fusing = bloater_fusing()
+	bloater_list = {}
 	local children = characters:GetChildren()
 	for i = 1, #children do
 		local child = children[i]
 		if is_bloater(child) then
-			local hp = bloater_health(child)
-			local dead = hp ~= nil and hp <= 0
-			if fusing or dead then
-				void_hrp(child)
+			bloater_list[#bloater_list + 1] = child
+			if fusing or bloater_should_void(child) then
+				void_model(child)
 			end
 		end
 	end
@@ -283,64 +339,129 @@ end
 local Lib
 do
 	local ok_load, result = pcall(function()
-		return loadstring(game:HttpGet("https://raw.githubusercontent.com/lec1e/Matcha-UI-Libraries/refs/heads/main/INS%20UI.lua"))()
+		return loadstring(http_get(INS_UI_URL))()
 	end)
-	Lib = (ok_load and result) or INSui
+	Lib = (ok_load and result) or INSUI or INSui
 end
 
 if not Lib then
-	error("[STA] INS ui failed to load — check HttpGet / INSui global")
+	error("[STA] INSUI failed to load — check HttpGet / INSUI global")
 end
 
 local win = Lib:CreateWindow({
 	title = "Survive the Apocalypse",
 	subtitle = "Melee",
-	size = Vector2.new(560, 420),
+	size = Vector2.new(620, 460),
 	menuKey = "p",
 	configName = "sta_melee",
 	configFolder = "sta_melee",
+	autoSave = true,
 	checkboxStyle = true,
 	smartFps = true,
+	keybindOverlay = true,
 	startOpen = true,
+	font = "Proxima",
+	opacity = 0.95,
+	gameInput = false,
+	backgroundEffect = "Off",
 })
 
+win:AddSettingsTab("cog")
 pcall(function()
-	win:AddSettingsTab("cog")
+	Lib:SetPerformance(true)
 end)
+
+local function bloater_note()
+	if not cfg.void_bloaters then
+		return "off"
+	end
+	local n = #bloater_list
+	if n == 0 then
+		return "none"
+	end
+	local hp = bloater_health(bloater_list[1])
+	return string.format("%d | HP %.0f", n, hp or -1)
+end
+
+local status_box
+local status_lines
+pcall(function()
+	status_box = Lib:CreateBox({
+		title = "STA",
+		position = Vector2.new(18, 120),
+		width = 220,
+	})
+	if status_box then
+		status_lines = {
+			status_box:Stat("status: idle"),
+			status_box:Stat("bloaters: none"),
+		}
+	end
+end)
+
+local last_box = ""
+local function refresh_status_box()
+	pcall(function()
+		if status_box then
+			status_box:SetVisible(win:IsOpen() ~= true)
+		end
+	end)
+	local note = bloater_note()
+	local key = tostring(status) .. "|" .. note
+	if key == last_box then
+		return
+	end
+	last_box = key
+	pcall(function()
+		if status_lines then
+			status_lines[1].Value = "status: " .. tostring(status)
+			status_lines[2].Value = "bloaters: " .. note
+		end
+	end)
+end
 
 Lib:Category("COMBAT")
 local tab = win:Tab("Melee", "swords")
+
 local sec = tab:Section("Combat", "Left", "held Tool → Swing + HitTargets")
 
 local melee_toggle = sec:Toggle("Enabled", false, function(on)
 	cfg.bat_hit_on = on == true
 	accum = 0
 	status = on and "armed" or "idle"
+	Lib:Notify("Melee", on and "enabled" or "disabled", 2, on and "success" or "warning")
 end)
-pcall(function()
-	melee_toggle:AddKeybind("b", "Toggle")
-end)
+melee_toggle:AddKeybind("b", "Toggle")
+melee_toggle:Tooltip("Fires Swing + HitTargets on the closest zombie. B toggles. P opens the menu.")
 
+sec:Divider("Timing")
 sec:Slider("Range", 50, 1, 1, 500, "studs", function(v)
 	cfg.bat_hit_range = tonumber(v) or 50
 end)
-
 sec:Slider("Attack Rate", 15, 1, 1, 40, "/s", function(v)
 	cfg.attack_rate = math.max(1, math.floor(tonumber(v) or 15))
 end)
-
 sec:Slider("Hits / Attack", 2, 1, 1, 6, "x", function(v)
 	cfg.hits_per_attack = math.max(1, math.floor(tonumber(v) or 2))
 end)
 
-sec:Toggle("Void Bloaters", true, function(on)
+local extras = tab:Section("Bloaters", "Right", "void dead / fusing Bloaters")
+extras:Toggle("Void Bloaters", true, function(on)
 	cfg.void_bloaters = on == true
-end)
+end, "send dead or fusing Bloaters under the map")
 
-sec:Label(function()
+extras:Divider("Status")
+extras:Label(function()
 	return "Status: " .. tostring(status)
 end)
-sec:Info("Hold any melee tool. Press P / B")
+extras:Label(function()
+	return "Bloaters: " .. bloater_note()
+end)
+extras:Info("Hold any melee tool. P toggles the menu, B toggles melee.")
+
+pcall(function()
+	Lib:Notify("Loaded", "Survive the Apocalypse — P / B", 3, "success")
+end)
 
 local hb = RunService.Heartbeat
 if not hb then
@@ -349,13 +470,10 @@ end
 
 local ok_conn, err_conn = pcall(function()
 	hb:Connect(function(dt)
+		local function frame(dt)
 		if cfg.void_bloaters then
-			bloater_scan_accum += dt
-			if bloater_scan_accum >= SCAN_INTERVAL then
-				bloater_scan_accum = 0
-				local character, characters = get_character()
-				handle_bloaters(characters)
-			end
+			local characters = Workspace:FindFirstChild("Characters")
+			handle_bloaters(characters)
 		end
 
 		if not cfg.bat_hit_on then
@@ -424,11 +542,13 @@ local ok_conn, err_conn = pcall(function()
 		end
 
 		if cfg.void_bloaters and is_bloater(zombie) then
-			local hp = bloater_health(zombie)
-			if hp ~= nil and hp <= 0 then
-				void_hrp(zombie)
+			if bloater_should_void(zombie) then
+				void_model(zombie)
 			end
 		end
+		end
+		frame(dt)
+		refresh_status_box()
 	end)
 end)
 
